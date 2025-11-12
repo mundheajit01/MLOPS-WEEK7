@@ -1,0 +1,20 @@
+# This file is for Scenario 2: Observing the Bottleneck
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: iris-ml-service-hpa-restricted
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: iris-ml-service
+  # We restrict maxReplicas to 1 to force a bottleneck
+  minReplicas: 1
+  maxReplicas: 1
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60

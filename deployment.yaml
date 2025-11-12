@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iris-ml-service
+spec:
+  # Set default pod availability to 1 as per assignment
+  replicas: 1
+  selector:
+    matchLabels:
+      app: iris-ml-service
+  template:
+    metadata:
+      labels:
+        app: iris-ml-service
+    spec:
+      # Using the service account from your gcloud commands
+      serviceAccountName: telemetry-access
+      containers:
+      - name: fastapi-container
+        # This image path will be REPLACED by the CI/CD pipeline
+        image: us-central1-docker.pkg.dev/your-project-id/my-repo/iris-app:latest
+        ports:
+        - containerPort: 8200
+        # Probes
+        readinessProbe:
+          httpGet:
+            path: /ready_check
+            port: 8200
+          initialDelaySeconds: 10 # Increased to allow for model "load"
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /live_check
+            port: 8200
+          initialDelaySeconds: 20
+          periodSeconds: 20
+        # Resource requests are CRITICAL for HPA to work
+        resources:
+          requests:
+            cpu: "200m" # Request 0.2 vCPU
+            memory: "128Mi"
+          limits:
+            cpu: "500m" # Max 0.5 vCPU
+            memory: "256Mi"

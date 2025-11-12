@@ -1,0 +1,164 @@
+name: Deploy, Test, and Observe Bottlenecks
+
+on:
+  push:
+    branches: [ "main" ] # Or your default branch
+
+env:
+  # --- CONFIGURE THESE ---
+  PROJECT_ID: "dulcet-bastion-452612-v4" # Change to your GCP Project ID
+  GKE_CLUSTER: "demo-log-ml-cluster"     # Your GKE cluster name
+  GKE_ZONE: "us-central1-a"              # Your GKE cluster zone
+  REPO_NAME: "my-repo"                   # Your Artifact Registry repo name
+  REGION: "us-central1"                  # Region for Artifact Registry
+  # --- END CONFIGURATION ---
+
+  IMAGE_NAME: "iris-pipeline-service"
+  DEPLOYMENT_NAME: "iris-ml-service"
+  SERVICE_NAME: "iris-ml-service"
+
+
+jobs:
+  build-and-deploy:
+    name: Build, Deploy, and Stress Test
+    runs-on: ubuntu-latest
+
+    # Add permissions for auth
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # 1. Authenticate to GCP
+    - id: 'auth'
+      uses: 'google-github-actions/auth@v2'
+      with:
+        # Use Workload Identity Federation (preferred) or Service Account Key
+        # This assumes WIF is set up. If using keys, use `credentials_json`
+        workload_identity_provider: 'projects/YOUR_PROJECT_NUMBER/locations/global/workloadIdentityPools/YOUR_POOL_ID/providers/YOUR_PROVIDER_ID'
+        service_account: 'your-github-actions-sa@${{ env.PROJECT_ID }}.iam.gserviceaccount.com'
+
+    # 2. Setup gcloud and get GKE credentials
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: ${{ env.PROJECT_ID }}
+
+    - name: Get GKE credentials
+      uses: google-github-actions/get-gke-credentials@v2
+      with:
+        cluster_name: ${{ env.GKE_CLUSTER }}
+        location: ${{ env.GKE_ZONE }}
+
+    # 3. Build and push the Docker image
+    - name: Configure Docker
+      run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ env.IMAGE_NAME }}:latest \
+          --build-arg GITHUB_SHA=$GITHUB_SHA \
+          --build-arg GITHUB_REF=$GITHUB_REF \
+          .
+    
+    - name: Tag & Push Docker image
+      run: |
+        export IMAGE_URL="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+        docker tag ${{ env.IMAGE_NAME }}:latest $IMAGE_URL
+        docker push $IMAGE_URL
+        echo "IMAGE_URL=$IMAGE_URL" >> $GITHUB_ENV
+
+    # 4. Deploy to Kubernetes
+    - name: Deploy to GKE
+      run: |
+        # Update the deployment.yaml with the new image URL
+        sed -i 's|image: .*|image: ${{ env.IMAGE_URL }}|g' deployment.yaml
+        
+        # Apply the manifests
+        kubectl apply -f deployment.yaml
+        kubectl apply -f service.yaml
+        
+        # Wait for the new deployment to be ready
+        echo "Waiting for deployment to rollout..."
+        kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} --timeout=5m
+        echo "Deployment complete."
+
+    # 5. Install wrk
+    - name: Install wrk
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y wrk
+
+    # 6. Get LoadBalancer IP
+    - name: Get Service IP
+      id: get-ip
+      run: |
+        echo "Waiting for LoadBalancer IP..."
+        retries=0
+        while [[ -z "$SERVICE_IP" && $retries -lt 30 ]]; do
+          SERVICE_IP=$(kubectl get svc ${{ env.SERVICE_NAME }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          [ -z "$SERVICE_IP" ] && sleep 10
+          retries=$((retries+1))
+        done
+
+        if [ -z "$SERVICE_IP" ]; then
+          echo "Error: LoadBalancer IP not found after 5 minutes."
+          kubectl get svc ${{ env.SERVICE_NAME }}
+          exit 1
+        fi
+        
+        echo "SERVICE_IP=$SERVICE_IP" >> $GITHUB_ENV
+        echo "Service IP is $SERVICE_IP"
+
+    # 7. SCENARIO 1: Test with Autoscaling (max_pods: 3)
+    - name: "TEST 1: Apply HPA (max_pods: 3)"
+      run: |
+        kubectl apply -f hpa.yaml
+        echo "--- Current HPA Status (Before Test 1) ---"
+        kubectl get hpa
+
+    - name: "RUN TEST 1: Concurrency 1000"
+      run: |
+        echo "Starting stress test: 4 threads, 1000 connections, 30 seconds"
+        wrk -t4 -c1000 -d30s --latency -s post.lua http://${{ env.SERVICE_IP }}:80/predict
+        echo "--- HPA Status (After Test 1) ---"
+        kubectl get hpa
+        echo "--- Pod Status (After Test 1) ---"
+        kubectl get pods -l app=${{ env.DEPLOYMENT_NAME }}
+
+    - name: Wait for Cooldown
+      run: |
+        echo "Waiting 2 minutes for pods to scale down..."
+        sleep 120
+
+    # 8. SCENARIO 2: Test Bottleneck (max_pods: 1)
+    - name: "TEST 2: Apply RESTRICTED HPA (max_pods: 1)"
+      run: |
+        # Delete old HPA and apply new one
+        kubectl delete -f hpa.yaml --ignore-not-found=true
+        kubectl apply -f hpa-restricted.yaml
+        echo "--- Current HPA Status (Before Test 2) ---"
+        kubectl get hpa
+
+    - name: "RUN TEST 2: Concurrency 2000"
+      run: |
+        echo "Starting stress test: 4 threads, 2000 connections, 30 seconds"
+        # We add || true because this test is *expected* to fail (return non-zero exit code)
+        # due to socket errors, which demonstrates the bottleneck.
+        wrk -t4 -c2000 -d30s --latency -s post.lua http://${{ env.SERVICE_IP }}:80/predict || true
+        
+        echo "--- HPA Status (After Test 2) ---"
+        # This is where you'll see the bottleneck:
+        # TARGETS will be > 100% (e.g., 500%/60%) but REPLICAS will stay at 1
+        kubectl get hpa
+        echo "--- Pod Status (After Test 2) ---"
+        kubectl get pods -l app=${{ env.DEPLOYMENT_NAME }}
+
+    - name: Cleanup
+      if: always() # Always run cleanup
+      run: |
+        echo "Cleaning up HPA resources"
+        kubectl delete -f hpa-restricted.yaml --ignore-not-found=true

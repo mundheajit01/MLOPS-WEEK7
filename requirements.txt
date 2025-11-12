@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+
+# Exporter for Google Cloud
+opentelemetry-exporter-gcp-trace
+
+# Added for loading the ML model
+scikit-learn
+joblib
+numpy
